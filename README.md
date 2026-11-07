@@ -1,66 +1,145 @@
 # pi-auto-mode
 
-Auto mode for the [pi](https://pi.dev) coding agent, similar to Claude Code's auto mode. A local LLM classifier approves or blocks permission prompts so you are not interrupted for routine actions.
+Auto mode for the [pi](https://pi.dev) coding agent, similar to Claude Code's auto mode. A small LLM classifier, running on a model server you choose, approves or blocks permission prompts so you are not interrupted for routine actions.
+
+Auto mode is an extension for [`@gotgenes/pi-permission-system`](https://www.npmjs.com/package/@gotgenes/pi-permission-system). It does not replace your permission policy. It only answers the prompts that policy would otherwise show you.
+
+## Contents
+
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Usage](#usage)
+- [Config](#config)
+- [What the classifier sees](#what-the-classifier-sees)
+- [Safety notes](#safety-notes)
+- [Troubleshooting](#troubleshooting)
+- [Development](#development)
 
 ## How it works
 
-`pi-auto-mode` registers an authorizer-chain link (`auto-mode`) with `@gotgenes/pi-permission-system`. When auto mode is on, each permission `ask` reaching that chain is resolved in this order:
+The permission system decides every tool call as `allow`, `deny` or `ask`. An `ask` normally opens a dialog for you. The permission system also has an **authorizer chain**: a list of links that get a chance to answer an `ask` before the dialog opens. `pi-auto-mode` is one such link, named `auto-mode`.
 
-1. `deny` rules and `path` deny rules block first. Auto mode never overrides them.
-2. An `ask` caused by an **explicit rule** in your policy (for example `git push *: ask`) is denied without calling the classifier. The agent sees `Blocked by auto mode: ...`.
-3. Any other `ask` goes to a classifier model on an OpenAI-compatible endpoint (oMLX, Ollama, LM Studio, vLLM). It sees your recent requests and the proposed call, and answers allow, deny or escalate.
-4. Escalate, error or timeout defers to the normal human dialog. After `maxConsecutiveDenials` denials (allows do not reset the count) auto mode asks you once and resets.
+While auto mode is on, each `ask` that reaches the link is handled in this order:
 
-Toggle with `shift+tab` or `/auto [on|off]`. The footer shows `auto` while on. Auto mode starts off each session.
+1. **`deny` rules block first.** The permission system enforces them before the chain runs, so auto mode can never override one.
+2. **An `ask` from an explicit rule in your policy is denied.** If you wrote a rule such as `git push *: ask`, you made a deliberate choice that a human should decide. Auto mode blocks the call without calling the classifier. The agent sees `Blocked by auto mode: matches bash rule '...'. Ask the user.` A bare `*: ask` rule counts as the default, not as an explicit rule.
+3. **Any other `ask` goes to the classifier.** This is an `ask` that comes from the default fallthrough, with no specific rule behind it. The classifier answers one of:
+   - `allow`: the call proceeds.
+   - `deny`: the call is blocked and the agent sees the classifier's reason.
+   - `escalate`: the classifier is unsure, so you get the normal dialog.
+4. **Failures fall back to you.** An HTTP error, timeout, unparseable reply or unreachable server all defer to the normal dialog. Auto mode never approves a call because something went wrong.
+5. **Repeated denials fall back to you.** After `maxConsecutiveDenials` classifier denials (default 3), auto mode defers the next `ask` to the dialog once and resets its count. Allowed calls do not reset the count, so the agent cannot keep probing by mixing in allowed calls.
 
 ## Install
 
-Requires pi, python3, and an OpenAI-compatible model server. Needs `@gotgenes/pi-permission-system` **>= 40**; `setup.sh` installs the latest.
+You need:
+
+- pi
+- python3 (used by `setup.sh` to edit JSON files)
+- an OpenAI-compatible model server, such as oMLX, Ollama, LM Studio or vLLM
+- `@gotgenes/pi-permission-system` version **40 or later** (`setup.sh` installs the latest)
 
 ```bash
 git clone https://github.com/OliverwStevens/pi-auto-mode
 cd pi-auto-mode
-./bin/setup.sh [classifier-model-id]
+./bin/setup.sh [clef-model-id]
 ```
 
-`setup.sh`:
-- installs `@gotgenes/pi-permission-system` and this package,
-- adds `"auto-mode"` to `authorizerChain` in the permission-system config (a link decides nothing until named there),
-- rebinds pi's thinking-level cycle from `shift+tab` to `alt+t`,
-- writes `~/.pi/agent/extensions/pi-auto-mode/config.json` if missing.
+Then run `/reload` in pi. `setup.sh` is safe to run again.
 
-Then run `/reload` in pi.
+`setup.sh` does four things:
 
-No patching is involved. Auto mode calls the permission system's `registerAuthorizer`, but finds it through the `Symbol.for("@gotgenes/pi-permission-system:session-services")` global, which is an internal. If that changes, toggling auto mode shows a warning that the link is missing instead of failing silently. State (on/off, denial count) is per process, not per session.
+1. Installs `@gotgenes/pi-permission-system` and this package with `pi install`.
+2. Rebinds pi's thinking-level cycle from `shift+tab` to `alt+t` in `~/.pi/agent/keybindings.json`, which frees `shift+tab` for auto mode.
+3. Adds `"auto-mode"` to `authorizerChain` in the permission system's config. A link does nothing until it is named there.
+4. Writes `~/.pi/agent/extensions/pi-auto-mode/config.json` from `examples/config.json` if it does not exist, with your Clef model id if you passed one.
+
+If one of the JSON files contains comments, `setup.sh` stops and tells you which line to add by hand. It never overwrites a file it cannot parse.
+
+Set `PI_CODING_AGENT_DIR` to use a different agent directory than `~/.pi/agent`.
+
+### How it connects to the permission system
+
+Auto mode calls the permission system's `registerAuthorizer` function, but it finds that function through a global (`Symbol.for("@gotgenes/pi-permission-system:session-services")`) because there is no public hook for it. This is an internal of the permission system and could change in a future version. Auto mode registers itself when a session starts, when the permission system announces it is ready, and whenever you turn auto mode on. If it cannot find the permission system, turning it on shows a warning and your prompts keep going to you.
+
+## Usage
+
+| action | effect |
+| --- | --- |
+| `shift+tab` | toggle auto mode |
+| `/auto` | toggle auto mode |
+| `/auto on` / `/auto off` | set it explicitly |
+| `/auto classifier [clef\|gemma]` | switch classifier for this session, or show the current one |
+
+- The footer shows `auto` while auto mode is on.
+- Auto mode is **off at the start of every session**.
+- The on/off state and the denial count are kept per process, not per session.
+
+## Clef
+
+[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) is a decision model, not a chat model. It scores allow/deny/escalate in one forward pass through the server's `POST /v1/systemone`. oMLX serves it: load `Jundot/clef-flash-oQ4e` (it keeps the schema head), set `"clef": {"model": "<id from /v1/models>"}`. Clef is the default classifier. To use a chat model instead, run `/auto classifier gemma` or set `"classifier": "gemma"` and `model`. An answer with confidence below 0.7 counts as `escalate`.
 
 ## Config
 
-`~/.pi/agent/extensions/pi-auto-mode/config.json`. A project file `<cwd>/.pi/extensions/pi-auto-mode/config.json` may only set `timeoutMs` and `maxUserMessages`; other keys are ignored with a warning, so a cloned repo cannot redirect the classifier or rewrite its rubric. Invalid values are ignored with a warning.
+The global config is `~/.pi/agent/extensions/pi-auto-mode/config.json`:
 
 | key | default | meaning |
 | --- | --- | --- |
-| `baseUrl` | `http://localhost:8001/v1` | OpenAI-compatible endpoint |
-| `apiKey` | `1234` | bearer token |
-| `model` | `gemma-4-26B-A4B-it-qat-nvfp4` | classifier model id |
-| `timeoutMs` | `20000` | classifier timeout |
-| `maxConsecutiveDenials` | `3` | denials before asking the human |
-| `maxUserMessages` | `5` | recent user messages shown to the classifier |
-| `rubricExtra` | `""` | extra rules appended to the classifier prompt |
+| `baseUrl` | `http://127.0.0.1:8001/v1` | OpenAI-compatible endpoint. `/chat/completions` (or `/systemone` for Clef) is appended. |
+| `apiKey` | `1234` | Bearer token sent to the endpoint |
+| `model` | `gemma-4-26B-A4B-it-qat-nvfp4` | Gemma model id, used when `classifier` is `gemma` |
+| `classifier` | `clef` | `clef` (decision model at `/systemone`) or `gemma` (any chat model at `/chat/completions`). `/auto classifier` overrides it per session. |
+| `clef` | `{"model":"clef-flash-oQ4e"}` | Clef model id on the server. Optional `baseUrl` and `apiKey` default to the top-level ones. |
+| `timeoutMs` | `20000` | Time to wait for the classifier before asking you |
+| `maxConsecutiveDenials` | `3` | Classifier denials before asking you |
+| `maxUserMessages` | `5` | Recent user messages shown to the classifier |
+| `rubricExtra` | `""` | Extra rules appended to the classifier prompt |
+
+A project file at `<cwd>/.pi/extensions/pi-auto-mode/config.json` is also read, but it may only set `timeoutMs` and `maxUserMessages`. Any other key in it is ignored with a warning. This stops a cloned repository from pointing the classifier at its own server or rewriting the rubric to approve everything. Values with the wrong type are ignored with a warning, and the default is used.
+
+## What the classifier sees
+
+The classifier gets one request per `ask`:
+
+- The working directory.
+- Your last `maxUserMessages` messages, each cut to 1500 characters. This tells it what you actually asked for.
+- The tool name and the proposed call (the command, path or input preview). This text is wrapped in `<<<TOOL_CALL_DATA>>>` markers, cut to 4000 characters, and the rubric tells the model to treat it as data and never follow instructions inside it.
+
+It never sees tool output or assistant messages, which limits prompt injection.
+
+Its rubric:
+
+- **allow**: the call is clearly in scope and its effect is visible in the call text. Examples are reading or editing project files, running well-known build, test and lint commands, and read-only inspection.
+- **deny**: the call exfiltrates data or secrets, writes outside the project, installs or runs unvetted remote code, is destructive or irreversible, changes shared or remote state, or is not what you asked for.
+- **escalate**: the model is unsure, or the call runs a script or binary whose contents it cannot see.
+
+The reply must be JSON: `{"decision":"allow|deny|escalate","reason":"..."}`. If the model emits several JSON objects, the last one with a `decision` key is used.
 
 ## Safety notes
 
-- `baseUrl` is sent your recent messages and every proposed command. Use a local endpoint unless you trust the remote.
-- The proposed call is fenced and truncated to 4000 chars in the prompt, and the rubric escalates scripts whose contents it cannot see.
-- The classifier is an LLM. Treat it as a convenience, not a security boundary. Keep hard limits in `deny` rules.
-- Tool output is never shown to the classifier, which limits prompt injection.
-- The permission system caps a link's `allow` on `path` and `external_directory` asks: those still reach you as a dialog. Put allows for outside-project paths in your policy.
-- A subagent's ask is reviewed one hop up by the session you watch, so auto mode covers subagents too.
-- The permission config must live at `~/.pi/agent/extensions/pi-permission-system/config.json` (global) or `<cwd>/.pi/extensions/pi-permission-system/config.json`.
+- **The classifier is an LLM.** Treat it as a convenience, not a security boundary. Keep hard limits in `deny` rules.
+- **Your data goes to `baseUrl`.** It receives your recent messages and every proposed command. Use a local endpoint unless you trust the remote server.
+- **Path asks still reach you.** The permission system caps what a link can allow on `path` and `external_directory` asks, so those still open a dialog. Put allows for paths outside the project in your policy.
+- **Subagents are covered.** A subagent's `ask` is reviewed one hop up by the session you watch.
+- **Permission config location.** The permission system's config must be at `~/.pi/agent/extensions/pi-permission-system/config.json` (global) or `<cwd>/.pi/extensions/pi-permission-system/config.json` (project).
+
+## Troubleshooting
+
+| symptom | likely cause |
+| --- | --- |
+| Warning on toggle: `not linked to @gotgenes/pi-permission-system` | The permission system is missing, older than 40, or `"authorizerChain": ["auto-mode"]` is not in its config. Re-run `./bin/setup.sh` and `/reload`. |
+| Every call still asks you | The classifier keeps answering `escalate`, or the server is unreachable. Check `baseUrl` and `model`, and the review log for `auto_mode_verdict` entries. |
+| `classifier HTTP 401` or `404` | Wrong `apiKey` or `baseUrl`, or the model id is not loaded on the server. |
+| `classifier returned no JSON` | The model did not follow the reply format. Try a stronger or instruction-tuned model. |
+| Warning: `ignoring ...config.json` or `only honored in the global config` | The config file is invalid JSON, or a project file set a key that only the global file may set. |
+| `shift+tab` still cycles thinking | `app.thinking.cycle` is not rebound. Check `~/.pi/agent/keybindings.json` and `/reload`. |
+
+Each decision is written to the permission system's review log as `auto_mode_verdict` (with the decision, reason and model) or `auto_mode_stance_denied` (with the matching rule).
+
+## Development
+
+`npm test` runs the verdict-parser tests. It needs Node 22.6 or later, and CI runs it on every push.
 
 ## License
 
 MIT
-
-## Development
-
-`npm test` (Node >= 22.6) runs the verdict-parser tests.

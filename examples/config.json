@@ -1,7 +1,9 @@
 {
-  "baseUrl": "http://localhost:8001/v1",
+  "baseUrl": "http://127.0.0.1:8001/v1",
   "apiKey": "1234",
   "model": "gemma-4-26B-A4B-it-qat-nvfp4",
+  "classifier": "clef",
+  "clef": { "model": "clef-flash-oQ4e" },
   "timeoutMs": 20000,
   "maxConsecutiveDenials": 3,
   "maxUserMessages": 5,

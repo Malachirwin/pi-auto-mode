@@ -51,7 +51,7 @@ if [ ! -f "$CFG" ]; then
   mkdir -p "$(dirname "$CFG")"
   cp "$HERE/examples/config.json" "$CFG"
   if [ -n "$MODEL" ]; then
-    MODEL="$MODEL" edit_json "$CFG" 'Set "model" by hand.' 'd["model"] = os.environ["MODEL"]' 
+    MODEL="$MODEL" edit_json "$CFG" 'Set "clef": {"model": ...} by hand.' 'd.setdefault("clef", {})["model"] = os.environ["MODEL"]' 
   fi
   echo "==> wrote $CFG (edit baseUrl/model/apiKey for your OpenAI-compatible endpoint)"
 fi

@@ -17,7 +17,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { classify, type Verdict as ClassifierVerdict } from "./classifier.js"
+import { classify, type ClassifierConfig, type Verdict as ClassifierVerdict } from "./classifier.js"
 
 const SERVICES_KEY = Symbol.for("@gotgenes/pi-permission-system:session-services")
 const LINK_NAME = "auto-mode"
@@ -48,12 +48,17 @@ interface Config {
   rubricExtra: string
   maxConsecutiveDenials: number
   maxUserMessages: number
+  classifier: "gemma" | "clef"
+  /** Used when classifier is "clef"; baseUrl/apiKey default to the top-level ones. */
+  clef: { model: string; baseUrl?: string; apiKey?: string }
 }
 
 const DEFAULTS: Config = {
-  baseUrl: "http://localhost:8001/v1",
+  baseUrl: "http://127.0.0.1:8001/v1",
   apiKey: "1234",
   model: "gemma-4-26B-A4B-it-qat-nvfp4",
+  classifier: "clef",
+  clef: { model: "clef-flash-oQ4e" },
   timeoutMs: 20000,
   rubricExtra: "",
   maxConsecutiveDenials: 3,
@@ -69,6 +74,13 @@ const VALIDATORS: { [K in keyof Config]: (v: unknown) => boolean } = {
   rubricExtra: (v) => typeof v === "string",
   maxConsecutiveDenials: isPosInt,
   maxUserMessages: isPosInt,
+  classifier: (v) => v === "gemma" || v === "clef",
+  clef: (v: any) =>
+    !!v &&
+    typeof v.model === "string" &&
+    v.model.length > 0 &&
+    (v.baseUrl === undefined || /^https?:\/\//.test(v.baseUrl)) &&
+    (v.apiKey === undefined || typeof v.apiKey === "string"),
 }
 
 // A repo-local file is untrusted: it must not redirect the classifier endpoint or rewrite its rubric.
@@ -94,6 +106,14 @@ function readConfigFile(path: string, allowed: (keyof Config)[], onWarn?: (msg: 
     else onWarn?.(`auto mode: ${path}: invalid value for '${k}'`)
   }
   return out as Partial<Config>
+}
+
+/** The classifier endpoint settings for the active classifier (Gemma chat or Clef SystemOne). */
+function activeClassifier(cfg: Config, override?: Config["classifier"]): ClassifierConfig {
+  const { baseUrl, apiKey, model, timeoutMs, rubricExtra } = cfg
+  return (override ?? cfg.classifier) === "clef"
+    ? { baseUrl, apiKey, timeoutMs, rubricExtra, ...cfg.clef, backend: "systemone" }
+    : { baseUrl, apiKey, model, timeoutMs, rubricExtra, backend: "chat" }
 }
 
 function loadConfig(cwd: string, onWarn?: (msg: string) => void): Config {
@@ -141,6 +161,7 @@ function explicitAsk(query: Query, d: AskDetails): string | undefined {
 
 export default function (pi: ExtensionAPI) {
   let enabled = false
+  let override: Config["classifier"] | undefined // set by `/auto classifier`, lasts for the session
   let consecutiveDenials = 0
   let ctxRef: ExtensionContext | undefined
   const disposers = new Map<string, () => void>() // sessionId -> unregister
@@ -167,7 +188,7 @@ export default function (pi: ExtensionAPI) {
     consecutiveDenials = 0
     setStatus(ctx)
     const cfg = loadConfig(ctx.cwd, (m) => ctx.ui?.notify(m, "warning"))
-    ctx.ui?.notify(`auto mode ${enabled ? "ON" : "OFF"} (classifier: ${cfg.model})`, "info")
+    ctx.ui?.notify(`auto mode ${enabled ? "ON" : "OFF"} (classifier: ${activeClassifier(cfg, override).model})`, "info")
     if (enabled) {
       registerExisting()
       if (disposers.size === 0) {
@@ -190,10 +211,11 @@ export default function (pi: ExtensionAPI) {
     }
 
     const cfg = loadConfig(ctx.cwd)
+    const active = activeClassifier(cfg, override)
     const summary = d.command ?? d.path ?? d.target ?? d.toolInputPreview ?? "(no detail)"
     let verdict: ClassifierVerdict
     try {
-      verdict = await classify(cfg, {
+      verdict = await classify(active, {
         userMessages: userMessages(ctx, cfg.maxUserMessages),
         toolName: d.toolName ?? "unknown",
         summary,
@@ -202,7 +224,7 @@ export default function (pi: ExtensionAPI) {
     } catch (e: any) {
       verdict = { decision: "escalate", reason: `classifier error: ${e?.name ?? e}` }
     }
-    log.review("auto_mode_verdict", { decision: verdict.decision, reason: verdict.reason, model: cfg.model })
+    log.review("auto_mode_verdict", { decision: verdict.decision, reason: verdict.reason, model: active.model })
 
     if (verdict.decision === "allow") return { kind: "allow" }
     if (verdict.decision === "deny") {
@@ -227,11 +249,18 @@ export default function (pi: ExtensionAPI) {
   })
 
   pi.registerCommand("auto", {
-    description: "Auto mode: /auto [on|off]",
+    description: "Auto mode: /auto [on|off] | /auto classifier [gemma|clef]",
     handler: async (args, ctx) => {
       const a = args.trim().toLowerCase()
       if (a === "" || a === "on" || a === "off") return toggle(ctx, a === "" ? undefined : a === "on")
-      ctx.ui?.notify("usage: /auto [on|off]", "warning")
+      const [word, which] = a.split(/\s+/)
+      if (word === "classifier" && (which === undefined || which === "gemma" || which === "clef")) {
+        if (which) override = which
+        const cfg = loadConfig(ctx.cwd, (m) => ctx.ui?.notify(m, "warning"))
+        const c = activeClassifier(cfg, override)
+        return ctx.ui?.notify(`auto mode classifier: ${override ?? cfg.classifier} (${c.model})`, "info")
+      }
+      ctx.ui?.notify("usage: /auto [on|off] | /auto classifier [gemma|clef]", "warning")
     },
   })
 
@@ -245,6 +274,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_e, ctx) => {
     ctxRef = ctx
     enabled = false
+    override = undefined
     consecutiveDenials = 0
     setStatus(ctx)
     registerExisting()
