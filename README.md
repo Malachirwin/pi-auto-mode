@@ -94,6 +94,7 @@ The global config is `~/.pi/agent/extensions/pi-auto-mode/config.json`:
 | `maxConsecutiveDenials` | `3` | Classifier denials before asking you |
 | `maxUserMessages` | `5` | Recent user messages shown to the classifier |
 | `rubricExtra` | `""` | Extra rules appended to the classifier prompt |
+| `alwaysOn` | `false` | Start with auto mode ON instead of OFF (session-scoped) |
 
 A project file at `<cwd>/.pi/extensions/pi-auto-mode/config.json` is also read, but it may only set `timeoutMs` and `maxUserMessages`. Any other key in it is ignored with a warning. This stops a cloned repository from pointing the classifier at its own server or rewriting the rubric to approve everything. Values with the wrong type are ignored with a warning, and the default is used.
 

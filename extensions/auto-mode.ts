@@ -63,6 +63,7 @@ const DEFAULTS: Config = {
   rubricExtra: "",
   maxConsecutiveDenials: 3,
   maxUserMessages: 5,
+  alwaysOn: false,
 }
 
 const isPosInt = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 1
@@ -81,6 +82,7 @@ const VALIDATORS: { [K in keyof Config]: (v: unknown) => boolean } = {
     v.model.length > 0 &&
     (v.baseUrl === undefined || /^https?:\/\//.test(v.baseUrl)) &&
     (v.apiKey === undefined || typeof v.apiKey === "string"),
+  alwaysOn: (v) => typeof v === "boolean",
 }
 
 // A repo-local file is untrusted: it must not redirect the classifier endpoint or rewrite its rubric.
@@ -126,7 +128,7 @@ function loadConfig(cwd: string, onWarn?: (msg: string) => void): Config {
       onWarn,
     ),
     ...readConfigFile(join(cwd, ".pi/extensions/pi-auto-mode/config.json"), PROJECT_KEYS, onWarn),
-  }
+  } as Config
 }
 
 function userMessages(ctx: ExtensionContext, max: number): string[] {
@@ -273,7 +275,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_e, ctx) => {
     ctxRef = ctx
-    enabled = false
+    const cfg = loadConfig(ctx.cwd)
+    enabled = cfg.alwaysOn ?? false
     override = undefined
     consecutiveDenials = 0
     setStatus(ctx)
