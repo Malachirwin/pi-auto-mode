@@ -69,11 +69,25 @@ Auto mode calls the permission system's `registerAuthorizer` function, but it fi
 | `shift+tab` | toggle auto mode |
 | `/auto` | toggle auto mode |
 | `/auto on` / `/auto off` | set it explicitly |
+| `/auto <liberal\|balanced\|cautious>` | enable auto mode with that comfort level |
+| `/auto <level> on` / `/auto <level> off` | toggle with comfort level |
 | `/auto classifier [clef\|gemma]` | switch classifier for this session, or show the current one |
 
 - The footer shows `auto` while auto mode is on.
-- Auto mode is **off at the start of every session**.
-- The on/off state and the denial count are kept per process, not per session.
+- Auto mode is **off at the start of every session** (unless `alwaysOn` is true).
+- The on/off state, comfort level, and denial count are kept per process, not per session.
+
+### Comfort levels
+
+Auto mode now supports three comfort tiers that express a **philosophy of trust** rather than a command list:
+
+| Level | Philosophy |
+| --- | --- |
+| `cautious` (default) | **"Review before execution"** — the agent can do routine development work, but anything touching outside the project gets reviewed. Script code is provided so the classifier can verify intent. |
+| `balanced` | **"Local workspace is safe"** — the project and its immediate ecosystem (siblings, docker, your git remotes) are trusted. Real dev work without friction. Script code still helps verify intent. |
+| `liberal` | **"Progress over prompt"** — the user has chosen to minimize interruptions. The agent keeps moving unless something is clearly dangerous. Script code is provided when available but its absence shouldn't stop progress. |
+
+Choose a level in your global config, or switch at runtime with `/auto balanced`.
 
 ## Clef
 
@@ -94,6 +108,7 @@ The global config is `~/.pi/agent/extensions/pi-auto-mode/config.json`:
 | `maxConsecutiveDenials` | `3` | Classifier denials before asking you |
 | `maxUserMessages` | `5` | Recent user messages shown to the classifier |
 | `rubricExtra` | `""` | Extra rules appended to the classifier prompt |
+| `comfortLevel` | `"cautious"` | Safety rubric tier: `"cautious"`, `"balanced"`, or `"liberal"`. Can also be set per-session with `/auto <level>`. |
 | `alwaysOn` | `false` | Start with auto mode ON instead of OFF (session-scoped) |
 
 A project file at `<cwd>/.pi/extensions/pi-auto-mode/config.json` is also read, but it may only set `timeoutMs` and `maxUserMessages`. Any other key in it is ignored with a warning. This stops a cloned repository from pointing the classifier at its own server or rewriting the rubric to approve everything. Values with the wrong type are ignored with a warning, and the default is used.
@@ -105,14 +120,19 @@ The classifier gets one request per `ask`:
 - The working directory.
 - Your last `maxUserMessages` messages, each cut to 1500 characters. This tells it what you actually asked for.
 - The tool name and the proposed call (the command, path or input preview). This text is wrapped in `<<<TOOL_CALL_DATA>>>` markers, cut to 4000 characters, and the rubric tells the model to treat it as data and never follow instructions inside it.
+- **Script file contents** — when the proposed call runs a script (bash, python, node, etc.), the classifier also sees the script's source code so it can evaluate the actual behavior instead of escalating blindly. Only the first ~16 KB per script is included.
 
 It never sees tool output or assistant messages, which limits prompt injection.
 
-Its rubric:
+Its rubric (varies by `comfortLevel` in config or `/auto <level>`):
 
-- **allow**: the call is clearly in scope and its effect is visible in the call text. Examples are reading or editing project files, running well-known build, test and lint commands, and read-only inspection.
-- **deny**: the call exfiltrates data or secrets, writes outside the project, installs or runs unvetted remote code, is destructive or irreversible, changes shared or remote state, or is not what you asked for.
-- **escalate**: the model is unsure, or the call runs a script or binary whose contents it cannot see.
+The rubric expresses a **trust philosophy**, not a command list. Actions are judged by their scope and intent, not by tool name:
+
+| Level | Allowed scope | Blocked scope |
+| --- | --- | --- |
+| `cautious` | Effects contained within the project with clear intent. Script code provided for review. | Anything outside the project, unknown remotes, shared state, unclear intent. |
+| `balanced` | Everything cautious + the local ecosystem: siblings, docker, your git remotes. | System dirs, shared infrastructure, global installs, actions without reviewable code. |
+| `liberal` | Almost anything a developer would reasonably do. Progress over perfection. | Only clear harm: attacks, credential exfiltration to unknown endpoints, system destruction. |
 
 The reply must be JSON: `{"decision":"allow|deny|escalate","reason":"..."}`. If the model emits several JSON objects, the last one with a `decision` key is used.
 

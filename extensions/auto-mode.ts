@@ -16,8 +16,8 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent"
 import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { join } from "node:path"
-import { classify, type ClassifierConfig, type Verdict as ClassifierVerdict } from "./classifier.js"
+import { join, resolve } from "node:path"
+import { classify, type ClassifierConfig, type ComfortLevel, type Verdict as ClassifierVerdict } from "./classifier.js"
 
 const SERVICES_KEY = Symbol.for("@gotgenes/pi-permission-system:session-services")
 const LINK_NAME = "auto-mode"
@@ -49,8 +49,12 @@ interface Config {
   maxConsecutiveDenials: number
   maxUserMessages: number
   classifier: "gemma" | "clef"
+  /** Comfort level for the safety rubric. Defaults to "cautious". */
+  comfortLevel: ComfortLevel
   /** Used when classifier is "clef"; baseUrl/apiKey default to the top-level ones. */
   clef: { model: string; baseUrl?: string; apiKey?: string }
+  /** Start auto mode ON for new sessions. (session-scoped) */
+  alwaysOn: boolean
 }
 
 const DEFAULTS: Config = {
@@ -58,6 +62,7 @@ const DEFAULTS: Config = {
   apiKey: "1234",
   model: "gemma-4-26B-A4B-it-qat-nvfp4",
   classifier: "clef",
+  comfortLevel: "cautious",
   clef: { model: "clef-flash-oQ4e" },
   timeoutMs: 20000,
   rubricExtra: "",
@@ -76,13 +81,14 @@ const VALIDATORS: { [K in keyof Config]: (v: unknown) => boolean } = {
   maxConsecutiveDenials: isPosInt,
   maxUserMessages: isPosInt,
   classifier: (v) => v === "gemma" || v === "clef",
+  comfortLevel: (v) => v === "liberal" || v === "balanced" || v === "cautious",
+  alwaysOn: (v) => typeof v === "boolean",
   clef: (v: any) =>
     !!v &&
     typeof v.model === "string" &&
     v.model.length > 0 &&
     (v.baseUrl === undefined || /^https?:\/\//.test(v.baseUrl)) &&
     (v.apiKey === undefined || typeof v.apiKey === "string"),
-  alwaysOn: (v) => typeof v === "boolean",
 }
 
 // A repo-local file is untrusted: it must not redirect the classifier endpoint or rewrite its rubric.
@@ -112,10 +118,11 @@ function readConfigFile(path: string, allowed: (keyof Config)[], onWarn?: (msg: 
 
 /** The classifier endpoint settings for the active classifier (Gemma chat or Clef SystemOne). */
 function activeClassifier(cfg: Config, override?: Config["classifier"]): ClassifierConfig {
-  const { baseUrl, apiKey, model, timeoutMs, rubricExtra } = cfg
-  return (override ?? cfg.classifier) === "clef"
-    ? { baseUrl, apiKey, timeoutMs, rubricExtra, ...cfg.clef, backend: "systemone" }
-    : { baseUrl, apiKey, model, timeoutMs, rubricExtra, backend: "chat" }
+  const { baseUrl, apiKey, model, timeoutMs, rubricExtra, comfortLevel } = cfg
+  if ((override ?? cfg.classifier) === "clef") {
+    return { baseUrl, apiKey, timeoutMs, rubricExtra, comfortLevel, ...cfg.clef, backend: "systemone" }
+  }
+  return { baseUrl, apiKey, model, timeoutMs, rubricExtra, comfortLevel, backend: "chat" }
 }
 
 function loadConfig(cwd: string, onWarn?: (msg: string) => void): Config {
@@ -145,6 +152,94 @@ function userMessages(ctx: ExtensionContext, max: number): string[] {
   return out.slice(-max)
 }
 
+/** Extract known-script files from a bash command so the classifier can inspect them. */
+function extractScriptPaths(command: string): string[] {
+  // Tokenize on spaces/shell operators, keep only file-like tokens
+  const tokens = command.split(/\s+/)
+  const seen = new Set<string>()
+  const scripts: string[] = []
+  const binPath = process.env.PATH ?? "/usr/bin:/bin:/usr/local/bin"
+
+  for (const token of tokens) {
+    // Skip paths that look like executables in system dirs
+    if (/^\//.test(token)) {
+      const abs = resolve(token)
+      // Only consider files inside project or cwd (not system bins)
+      const cwdAbs = resolve(cwdDir)
+      if (abs.startsWith(cwdAbs + "/") || abs.startsWith(cwdAbs)) {
+        if (!seen.has(abs)) { scripts.push(abs); seen.add(abs) }
+      }
+    }
+    // Token might be a script with an interpreter prefix, e.g. `python3 myscript.py`
+    // The second token could be a script path
+  }
+  return scripts
+}
+
+// Store cwd so extractScriptPaths can resolve relative paths
+let cwdDir = ""
+
+/** Read script file contents up to a reasonable size. Returns empty strings for missing/large files. */
+function readScripts(paths: string[]): string[] {
+  const MAX_BYTES = 16_000
+  return paths
+    .map((p) => {
+      if (!existsSync(p)) return ""
+      const raw = readFileSync(p, "utf-8")
+      if (raw.length > MAX_BYTES) return raw.slice(0, MAX_BYTES) + "\n[truncated - too large to read in full]"
+      return raw
+    })
+    .filter(Boolean)
+}
+
+/** Detects script files in a command string and returns their contents for the classifier. */
+function resolveScriptContents(command: string | undefined, cwd: string): string[] {
+  if (!command) return []
+  cwdDir = cwd
+  // Common script invocation patterns
+  const scriptExtensions = [".sh", ".bash", ".py", ".js", ".ts", ".rb", ".pl", ".php"]
+  const knownInterpreters = new Set(["bash", "sh", "python3", "python", "node", "python", "ruby", "perl", "php"])
+
+  const tokens = command.split(/\s+/)
+  const seen = new Set<string>()
+  const scripts: string[] = []
+
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i]
+    // Skip shell operators and pipes
+    if (/^[|;&$]/.test(tok) || /^\-/.test(tok)) continue
+
+    const abs = resolve(join(cwd, tok))
+
+    // Token itself looks like a script file
+    if (scriptExtensions.some((ext) => tok.endsWith(ext))) {
+      if (!seen.has(abs)) { scripts.push(abs); seen.add(abs) }
+      continue
+    }
+
+    // Token is a known interpreter, next token is the script
+    if (knownInterpreters.has(tok) && i + 1 < tokens.length) {
+      const script = tokens[i + 1]
+      if (scriptExtensions.some((ext) => script.endsWith(ext))) {
+        const scriptAbs = resolve(join(cwd, script))
+        if (!seen.has(scriptAbs)) { scripts.push(scriptAbs); seen.add(scriptAbs) }
+      }
+    }
+
+    // Token is ./something or ../something without extension — could be a bash script
+    if ((tok.startsWith("./") || tok.startsWith("../")) && !tok.includes("/")) {
+      for (const ext of ["", ...scriptExtensions]) {
+        const candidate = resolve(join(cwd, tok + ext))
+        if (existsSync(candidate) && !seen.has(candidate)) {
+          scripts.push(candidate); seen.add(candidate); break
+        }
+      }
+    }
+  }
+
+  return readScripts(scripts)
+}
+
 /** An `ask` caused by an explicit rule in the policy is a stance, not a gap. */
 function explicitAsk(query: Query, d: AskDetails): string | undefined {
   const probes: [string, string | undefined][] = [[d.toolName ?? "", d.command ?? d.path ?? d.target]]
@@ -164,6 +259,7 @@ function explicitAsk(query: Query, d: AskDetails): string | undefined {
 export default function (pi: ExtensionAPI) {
   let enabled = false
   let override: Config["classifier"] | undefined // set by `/auto classifier`, lasts for the session
+  let comfortLevel: ComfortLevel = "cautious" // set by `/auto on <level>`, lasts for the session
   let consecutiveDenials = 0
   let ctxRef: ExtensionContext | undefined
   const disposers = new Map<string, () => void>() // sessionId -> unregister
@@ -190,7 +286,10 @@ export default function (pi: ExtensionAPI) {
     consecutiveDenials = 0
     setStatus(ctx)
     const cfg = loadConfig(ctx.cwd, (m) => ctx.ui?.notify(m, "warning"))
-    ctx.ui?.notify(`auto mode ${enabled ? "ON" : "OFF"} (classifier: ${activeClassifier(cfg, override).model})`, "info")
+    ctx.ui?.notify(
+      `auto mode ${enabled ? "ON" : "OFF"} (classifier: ${activeClassifier(cfg, override).model}, comfort: ${cfg.comfortLevel})`,
+      "info",
+    )
     if (enabled) {
       registerExisting()
       if (disposers.size === 0) {
@@ -214,14 +313,22 @@ export default function (pi: ExtensionAPI) {
 
     const cfg = loadConfig(ctx.cwd)
     const active = activeClassifier(cfg, override)
+    // Merge session-level comfortLevel override (from /auto on <level>)
+    const activeWithComfort: ClassifierConfig = {
+      ...active,
+      comfortLevel: comfortLevel ?? cfg.comfortLevel,
+    }
     const summary = d.command ?? d.path ?? d.target ?? d.toolInputPreview ?? "(no detail)"
+    // Resolve script file contents for the classifier to inspect
+    const scriptContents = resolveScriptContents(d.command, ctx.cwd)
     let verdict: ClassifierVerdict
     try {
-      verdict = await classify(active, {
+      verdict = await classify(activeWithComfort, {
         userMessages: userMessages(ctx, cfg.maxUserMessages),
         toolName: d.toolName ?? "unknown",
         summary,
         cwd: ctx.cwd,
+        scriptContents,
       })
     } catch (e: any) {
       verdict = { decision: "escalate", reason: `classifier error: ${e?.name ?? e}` }
@@ -251,18 +358,50 @@ export default function (pi: ExtensionAPI) {
   })
 
   pi.registerCommand("auto", {
-    description: "Auto mode: /auto [on|off] | /auto classifier [gemma|clef]",
+    description:
+      'Auto mode: /auto [on|off] | /auto <level> [on|off] | /auto classifier [gemma|clef]',
     handler: async (args, ctx) => {
       const a = args.trim().toLowerCase()
       if (a === "" || a === "on" || a === "off") return toggle(ctx, a === "" ? undefined : a === "on")
-      const [word, which] = a.split(/\s+/)
+      const parts = a.split(/\s+/)
+      // /auto <level> — enables auto mode with that comfort level
+      if (
+        (parts[0] === "liberal" || parts[0] === "balanced" || parts[0] === "cautious") &&
+        (parts[1] === undefined || parts[1] === "on" || parts[1] === "off")
+      ) {
+        const level = parts[0] as ComfortLevel
+        const next = parts[1] === "off" ? false : true
+        enabled = next
+        comfortLevel = level
+        consecutiveDenials = 0
+        setStatus(ctx)
+        const cfg = loadConfig(ctx.cwd, (m) => ctx.ui?.notify(m, "warning"))
+        ctx.ui?.notify(
+          `auto mode ${enabled ? "ON" : "OFF"} (${level}, classifier: ${activeClassifier(cfg, override).model})`,
+          "info",
+        )
+        if (enabled) {
+          registerExisting()
+          if (disposers.size === 0) {
+            ctx.ui?.notify(
+              'auto mode: not linked to @gotgenes/pi-permission-system (>= 40, "authorizerChain": ["auto-mode"]); prompts still go to you',
+              "warning",
+            )
+          }
+        }
+        return
+      }
+      const [word, which] = parts
       if (word === "classifier" && (which === undefined || which === "gemma" || which === "clef")) {
         if (which) override = which
         const cfg = loadConfig(ctx.cwd, (m) => ctx.ui?.notify(m, "warning"))
         const c = activeClassifier(cfg, override)
         return ctx.ui?.notify(`auto mode classifier: ${override ?? cfg.classifier} (${c.model})`, "info")
       }
-      ctx.ui?.notify("usage: /auto [on|off] | /auto classifier [gemma|clef]", "warning")
+      ctx.ui?.notify(
+        "usage: /auto [on|off] | /auto <liberal|balanced|cautious> [on|off] | /auto classifier [gemma|clef]",
+        "warning",
+      )
     },
   })
 
@@ -277,6 +416,7 @@ export default function (pi: ExtensionAPI) {
     ctxRef = ctx
     const cfg = loadConfig(ctx.cwd)
     enabled = cfg.alwaysOn ?? false
+    comfortLevel = cfg.comfortLevel
     override = undefined
     consecutiveDenials = 0
     setStatus(ctx)
