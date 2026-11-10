@@ -69,29 +69,40 @@ Auto mode calls the permission system's `registerAuthorizer` function, but it fi
 | `shift+tab` | toggle auto mode |
 | `/auto` | toggle auto mode |
 | `/auto on` / `/auto off` | set it explicitly |
-| `/auto <liberal\|balanced\|cautious>` | enable auto mode with that comfort level |
-| `/auto <level> on` / `/auto <level> off` | toggle with comfort level |
+| `/auto <cautious\|balanced\|liberal>` | turn auto mode on at that comfort level for this session |
+| `/auto <level> off` | turn it off and keep that level for next time |
 | `/auto classifier [clef\|gemma]` | switch classifier for this session, or show the current one |
 
-- The footer shows `auto` while auto mode is on.
+- The footer shows `auto: <level>` while auto mode is on.
 - Auto mode is **off at the start of every session** (unless `alwaysOn` is true).
 - The on/off state, comfort level, and denial count are kept per process, not per session.
 
 ### Comfort levels
 
-Auto mode now supports three comfort tiers that express a **philosophy of trust** rather than a command list:
+Each level draws a **trusted zone**. Calls whose effect stays inside it are allowed. Legitimate calls that reach past it escalate to you. Calls that cross a hard line are denied at every level. Each level widens the zone of the one below it.
 
-| Level | Philosophy |
-| --- | --- |
-| `cautious` (default) | **"Review before execution"** — the agent can do routine development work, but anything touching outside the project gets reviewed. Script code is provided so the classifier can verify intent. |
-| `balanced` | **"Local workspace is safe"** — the project and its immediate ecosystem (siblings, docker, your git remotes) are trusted. Real dev work without friction. Script code still helps verify intent. |
-| `liberal` | **"Progress over prompt"** — the user has chosen to minimize interruptions. The agent keeps moving unless something is clearly dangerous. Script code is provided when available but its absence shouldn't stop progress. |
+| Level | Trusted zone | Still asks you about |
+| --- | --- | --- |
+| `cautious` (default) | The project directory: edits, deletes, build/test/lint, project scripts it can read, dependency installs, undoable git | Writes outside the project, any remote change (push, PRs, publish), global installs, docker, programs it cannot identify |
+| `balanced` | The local workspace: also sibling repos, local containers and dev databases, network reads, user-level installs, pushes to feature branches and PRs | Pushes to the default branch, force-push, deploys and publishing, production or shared cloud, CI config, sudo and system files |
+| `liberal` | Anything your account can do that only affects your own work and can be recovered | Irreversible changes to shared or production systems, sudo and system config |
 
-Choose a level in your global config, or switch at runtime with `/auto balanced`.
+**Hard lines (denied at every level):** sending secrets off the machine or reading credential stores the task does not need, piping downloaded code into a shell, reverse shells and privilege escalation, wiping data outside the project, and anything your messages say not to do.
+
+Explicit `ask` rules in your permission policy always win over the comfort level.
+
+### Basic commands skip the classifier
+
+Simple shell commands are allowed without a classifier call, so `ls`, `git status` and `grep … | head` never wait on the model:
+
+- **Every level:** read-only inspection (`ls`, `cat`, `grep`, `rg`, `find` without `-exec`/`-delete`, `git status|log|diff|show|blame`, …) and undoable git bookkeeping (`git add|commit|switch|stash|fetch`, `mkdir`, `touch`).
+- **`balanced` and `liberal`:** the project's own tasks too (`npm test`, `npm run …`, `cargo test`, `go test`, `pytest`, `bundle exec rspec`, `tsc`, `eslint`, …).
+
+A command qualifies only if every part of a `&&`, `||`, `;` or `|` chain is on the list, and it has no command substitution, no redirect other than to `/dev/null`, no environment assignments, and no reference to credential files. Anything else goes to the classifier.
 
 ## Clef
 
-[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) is a decision model, not a chat model. It scores allow/deny/escalate in one forward pass through the server's `POST /v1/systemone`. oMLX serves it: load `Jundot/clef-flash-oQ4e` (it keeps the schema head), set `"clef": {"model": "<id from /v1/models>"}`. Clef is the default classifier. To use a chat model instead, run `/auto classifier gemma` or set `"classifier": "gemma"` and `model`. An answer with confidence below 0.7 counts as `escalate`.
+[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) is a decision model, not a chat model. It scores allow/deny/escalate in one forward pass through the server's `POST /v1/systemone`. oMLX serves it: load `Jundot/clef-flash-oQ4e` (it keeps the schema head), set `"clef": {"model": "<id from /v1/models>"}`. Clef is the default classifier. To use a chat model instead, run `/auto classifier gemma` or set `"classifier": "gemma"` and `model`. An answer below the level's confidence floor counts as `escalate`: 0.7 for `cautious`, 0.6 for `balanced`, 0.5 for `liberal`.
 
 ## Config
 
@@ -120,19 +131,11 @@ The classifier gets one request per `ask`:
 - The working directory.
 - Your last `maxUserMessages` messages, each cut to 1500 characters. This tells it what you actually asked for.
 - The tool name and the proposed call (the command, path or input preview). This text is wrapped in `<<<TOOL_CALL_DATA>>>` markers, cut to 4000 characters, and the rubric tells the model to treat it as data and never follow instructions inside it.
-- **Script file contents** — when the proposed call runs a script (bash, python, node, etc.), the classifier also sees the script's source code so it can evaluate the actual behavior instead of escalating blindly. Only the first ~16 KB per script is included.
+- **Script sources**: when the command runs a script inside the project (`./bin/x`, `python tools/y.py`), the first 16 KB of up to three scripts, inside the same untrusted-data markers. Scripts outside the project are judged by their name and arguments.
 
 It never sees tool output or assistant messages, which limits prompt injection.
 
-Its rubric (varies by `comfortLevel` in config or `/auto <level>`):
-
-The rubric expresses a **trust philosophy**, not a command list. Actions are judged by their scope and intent, not by tool name:
-
-| Level | Allowed scope | Blocked scope |
-| --- | --- | --- |
-| `cautious` | Effects contained within the project with clear intent. Script code provided for review. | Anything outside the project, unknown remotes, shared state, unclear intent. |
-| `balanced` | Everything cautious + the local ecosystem: siblings, docker, your git remotes. | System dirs, shared infrastructure, global installs, actions without reviewable code. |
-| `liberal` | Almost anything a developer would reasonably do. Progress over perfection. | Only clear harm: attacks, credential exfiltration to unknown endpoints, system destruction. |
+The rubric is built from the comfort level: what each decision means, the level's trusted zone with what it allows and what escalates, the hard lines, and which way to lean when unsure (`cautious` escalates, `balanced` allows local undoable effects, `liberal` allows). It judges calls by their effect, not by whether it recognizes the tool, and it does not escalate only because a script's source is missing.
 
 The reply must be JSON: `{"decision":"allow|deny|escalate","reason":"..."}`. If the model emits several JSON objects, the last one with a `decision` key is used.
 
