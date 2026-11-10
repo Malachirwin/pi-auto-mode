@@ -91,15 +91,6 @@ Each level draws a **trusted zone**. Calls whose effect stays inside it are allo
 
 Explicit `ask` rules in your permission policy always win over the comfort level.
 
-### Basic commands skip the classifier
-
-Simple shell commands are allowed without a classifier call, so `ls`, `git status` and `grep … | head` never wait on the model:
-
-- **Every level:** read-only inspection (`ls`, `cat`, `grep`, `rg`, `find` without `-exec`/`-delete`, `git status|log|diff|show|blame`, …) and undoable git bookkeeping (`git add|commit|switch|stash|fetch`, `mkdir`, `touch`).
-- **`balanced` and `liberal`:** the project's own tasks too (`npm test`, `npm run …`, `cargo test`, `go test`, `pytest`, `bundle exec rspec`, `tsc`, `eslint`, …).
-
-A command qualifies only if every part of a `&&`, `||`, `;` or `|` chain is on the list, and it has no command substitution, no redirect other than to `/dev/null`, no environment assignments, and no reference to credential files. Anything else goes to the classifier.
-
 ## Clef
 
 [Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) is a decision model, not a chat model. It scores allow/deny/escalate in one forward pass through the server's `POST /v1/systemone`. oMLX serves it: load `Jundot/clef-flash-oQ4e` (it keeps the schema head), set `"clef": {"model": "<id from /v1/models>"}`. Clef is the default classifier. To use a chat model instead, run `/auto classifier gemma` or set `"classifier": "gemma"` and `model`. An answer below the level's confidence floor counts as `escalate`: 0.7 for `cautious`, 0.6 for `balanced`, 0.5 for `liberal`.

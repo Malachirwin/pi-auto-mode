@@ -4,9 +4,8 @@
  * /auto [on|off] or shift+tab toggles auto mode. While on, an `ask` that reaches the
  * permission system's authorizer chain is resolved here instead of by the human:
  *   1. ask matched by an explicit rule in the user's policy -> deny, classifier never runs
- *   2. basic shell command safe at the comfort level        -> allow, classifier never runs
- *   3. any other ask                                        -> local OpenAI-compatible classifier
- *   4. classifier unsure / error / timeout                  -> defer (human dialog)
+ *   2. ask from the default fallthrough                     -> local OpenAI-compatible classifier
+ *   3. classifier unsure / error / timeout                  -> defer (human dialog)
  * `deny` rules are enforced by the permission system before the chain and never reach here.
  *
  * Reaches the permission system through its session-services global (no public hook for this);
@@ -19,7 +18,6 @@ import { existsSync, readFileSync, statSync } from "node:fs"
 import { homedir } from "node:os"
 import { join, relative, resolve, sep } from "node:path"
 import { classify, type ClassifierConfig, type ComfortLevel, type Verdict as ClassifierVerdict } from "./classifier.js"
-import { isSafeCommand } from "./safe-commands.js"
 
 const SERVICES_KEY = Symbol.for("@gotgenes/pi-permission-system:session-services")
 const LINK_NAME = "auto-mode"
@@ -257,11 +255,6 @@ export default function (pi: ExtensionAPI) {
     if (stance) {
       log.review("auto_mode_stance_denied", { rule: stance })
       return { kind: "deny", reason: `Blocked by auto mode: matches ${stance}. Ask the user.` }
-    }
-
-    if (d.toolName === "bash" && d.command && isSafeCommand(d.command, comfortLevel)) {
-      log.review("auto_mode_safe_command", { level: comfortLevel })
-      return { kind: "allow" }
     }
 
     const cfg = loadConfig(ctx.cwd)
